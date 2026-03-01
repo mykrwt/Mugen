@@ -10,7 +10,7 @@ import {
 import type { Habit, DailyLog } from '../db';
 import {
   getLogForHabitDate, addLog, updateLog, generateId,
-  getLogsByDate, addHabit, updateHabit, deleteHabit
+  getLogsByDate, addHabit, updateHabit, deleteHabit,
 } from '../db';
 import { EXCUSE_OPTIONS } from '../analytics';
 import { computeDailyScore, computeStreak, getMostCommonExcuse } from '../analytics';
@@ -28,14 +28,14 @@ interface Props {
 }
 
 const REASON_CONFIG: Record<string, { icon: React.ReactNode; label: string; sub: string }> = {
-  'Lazy': { icon: <BedDouble size={15} />, label: "No motivation", sub: "Didn't feel like it" },
-  'Distracted': { icon: <Smartphone size={15} />, label: 'Distracted', sub: 'Lost focus' },
-  'No time': { icon: <Clock size={15} />, label: 'No time', sub: 'Schedule clash' },
-  'Low energy': { icon: <BatteryLow size={15} />, label: 'Low energy', sub: 'Physically drained' },
-  'Emotional issue': { icon: <HeartCrack size={15} />, label: 'Emotional', sub: 'Stress or mood' },
-  'Forgot': { icon: <BrainCircuit size={15} />, label: 'Forgot', sub: 'Slipped my mind' },
-  'Avoided deliberately': { icon: <ShieldOff size={15} />, label: 'Chose to skip', sub: 'Conscious choice' },
-  'Other': { icon: <MessageCircle size={15} />, label: 'Other', sub: 'Describe below' },
+  'Lazy':               { icon: <BedDouble size={15} />,    label: 'No motivation',   sub: "Didn't feel like it" },
+  'Distracted':         { icon: <Smartphone size={15} />,   label: 'Distracted',      sub: 'Lost focus' },
+  'No time':            { icon: <Clock size={15} />,        label: 'No time',         sub: 'Schedule clash' },
+  'Low energy':         { icon: <BatteryLow size={15} />,   label: 'Low energy',      sub: 'Physically drained' },
+  'Emotional issue':    { icon: <HeartCrack size={15} />,   label: 'Emotional',       sub: 'Stress or mood' },
+  'Forgot':             { icon: <BrainCircuit size={15} />, label: 'Forgot',          sub: 'Slipped my mind' },
+  'Avoided deliberately': { icon: <ShieldOff size={15} />, label: 'Chose to skip',   sub: 'Conscious choice' },
+  'Other':              { icon: <MessageCircle size={15} />, label: 'Other',          sub: 'Describe below' },
 };
 
 const CATEGORIES = ['Health', 'Fitness', 'Mind', 'Productivity', 'Finance', 'Relationships', 'Skills', 'Other'];
@@ -47,6 +47,7 @@ type FormState = {
   targetType: 'boolean' | 'numeric';
   targetValue: string;
 };
+
 const DEFAULT_FORM: FormState = {
   name: '',
   icon: 'Target',
@@ -55,14 +56,13 @@ const DEFAULT_FORM: FormState = {
   targetValue: '',
 };
 
-// Reason modal state type
 type ReasonModalState = {
   habitId: string;
   habitName: string;
   habitIcon: string;
-  existingLog?: DailyLog;       // The log we're updating (if unchecking or already has skip)
-  numValue?: number;             // For numeric habits that didn't meet target
-  mode: 'uncheck' | 'skip';    // 'uncheck' = was completed, now removing; 'skip' = never completed
+  existingLogId?: string;   // ID of log to update (if exists)
+  numValue?: number;
+  mode: 'uncheck' | 'skip';
 };
 
 export default function HomeView({ habits, logs, selectedDate, onDateChange, onRefresh, navigateTo }: Props) {
@@ -73,7 +73,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
   const [processing, setProcessing] = useState<string | null>(null);
 
   const [reasonModal, setReasonModal] = useState<ReasonModalState | null>(null);
-  const [numericModal, setNumericModal] = useState<{ habit: Habit; log?: DailyLog } | null>(null);
+  const [numericModal, setNumericModal] = useState<{ habit: Habit; existingLogId?: string } | null>(null);
   const [habitFormModal, setHabitFormModal] = useState<{ editing?: Habit } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
@@ -139,30 +139,32 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
     if (processing) return;
     setMenuOpen(null);
     setProcessing(habit.id);
+
     try {
+      // Always fetch fresh from DB — never trust stale state
       const existing = await getLogForHabitDate(habit.id, selectedDate);
 
       if (habit.targetType === 'numeric') {
         setNumericValue(existing?.value?.toString() || '');
-        setNumericModal({ habit, log: existing });
+        setNumericModal({ habit, existingLogId: existing?.id });
         setProcessing(null);
         return;
       }
 
       if (existing?.completed) {
-        // Was completed → tapping again to UNCHECK → ask for reason
+        // Was completed → uncheck → ask for reason
         setSelectedReason(null);
         setOtherText('');
         setReasonModal({
           habitId: habit.id,
           habitName: habit.name,
           habitIcon: habit.icon,
-          existingLog: existing,
+          existingLogId: existing.id,
           mode: 'uncheck',
         });
         setProcessing(null);
       } else if (existing && !existing.completed) {
-        // Was skipped → re-mark as done (clear excuse)
+        // Was skipped → mark done (clear excuse)
         await updateLog({
           ...existing,
           completed: true,
@@ -189,17 +191,21 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
         await onRefresh();
         setProcessing(null);
       }
-    } catch (e) { console.error(e); setProcessing(null); }
+    } catch (e) {
+      console.error('handleHabitTap error:', e);
+      setProcessing(null);
+    }
   };
 
-  const openReasonForSkip = (habit: Habit) => {
+  const openReasonForSkip = async (habit: Habit) => {
     setMenuOpen(null);
-    const existing = dayLogs.get(habit.id);
+    // Always fetch fresh from DB
+    const existing = await getLogForHabitDate(habit.id, selectedDate);
     setReasonModal({
       habitId: habit.id,
       habitName: habit.name,
       habitIcon: habit.icon,
-      existingLog: existing,
+      existingLogId: existing?.id,
       mode: 'skip',
     });
     setSelectedReason(null);
@@ -221,19 +227,41 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
     const reflection = selectedReason === 'Other' ? otherText.trim() : null;
 
     try {
-      const existingLog = reasonModal.existingLog;
-
-      if (existingLog) {
-        // Update the existing log → mark as NOT completed with excuse
-        await updateLog({
-          ...existingLog,
-          completed: false,
-          excuseTag,
-          reflectionText: reflection,
-          loggedAt: Date.now(),
-        });
+      if (reasonModal.existingLogId) {
+        // Fetch the exact log from DB by ID to avoid stale data
+        const fresh = await getLogForHabitDate(reasonModal.habitId, selectedDate);
+        if (fresh && fresh.id === reasonModal.existingLogId) {
+          await updateLog({
+            ...fresh,
+            completed: false,
+            excuseTag,
+            reflectionText: reflection,
+            loggedAt: Date.now(),
+          });
+        } else if (fresh) {
+          // Log exists but ID mismatch — update what we have
+          await updateLog({
+            ...fresh,
+            completed: false,
+            excuseTag,
+            reflectionText: reflection,
+            loggedAt: Date.now(),
+          });
+        } else {
+          // Log was deleted meanwhile — create new one
+          await addLog({
+            id: generateId(),
+            habitId: reasonModal.habitId,
+            date: selectedDate,
+            value: reasonModal.numValue ?? null,
+            completed: false,
+            excuseTag,
+            reflectionText: reflection,
+            loggedAt: Date.now(),
+          });
+        }
       } else {
-        // Create a new skip log
+        // No existing log — create skip log
         await addLog({
           id: generateId(),
           habitId: reasonModal.habitId,
@@ -250,7 +278,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
       await loadLogs();
       await onRefresh();
     } catch (e) {
-      console.error(e);
+      console.error('handleReasonSubmit error:', e);
     } finally {
       setSubmittingReason(false);
     }
@@ -265,12 +293,13 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
 
     if (!completed) {
       // Didn't meet target → ask for reason
+      const existingLogId = numericModal.existingLogId;
       setNumericModal(null);
       setReasonModal({
         habitId: numericModal.habit.id,
         habitName: numericModal.habit.name,
         habitIcon: numericModal.habit.icon,
-        existingLog: numericModal.log,
+        existingLogId,
         numValue: val,
         mode: 'skip',
       });
@@ -280,15 +309,18 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
     }
 
     try {
-      if (numericModal.log) {
-        await updateLog({
-          ...numericModal.log,
-          value: val,
-          completed: true,
-          excuseTag: null,
-          reflectionText: null,
-          loggedAt: Date.now(),
-        });
+      if (numericModal.existingLogId) {
+        const fresh = await getLogForHabitDate(numericModal.habit.id, selectedDate);
+        if (fresh) {
+          await updateLog({
+            ...fresh,
+            value: val,
+            completed: true,
+            excuseTag: null,
+            reflectionText: null,
+            loggedAt: Date.now(),
+          });
+        }
       } else {
         await addLog({
           id: generateId(),
@@ -305,7 +337,9 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
       setNumericValue('');
       await loadLogs();
       await onRefresh();
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      console.error('handleNumericSubmit error:', e);
+    }
   };
 
   // ===== HABIT MANAGEMENT =====
@@ -371,22 +405,26 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
       closeHabitForm();
       await onRefresh();
     } catch (e) {
-      console.error(e);
+      console.error('handleSaveHabit error:', e);
       setSaving(false);
     }
   };
 
   const handleDeleteHabit = async (id: string) => {
-    await deleteHabit(id);
-    setDeleteConfirm(null);
-    setMenuOpen(null);
-    await onRefresh();
+    try {
+      await deleteHabit(id);
+      setDeleteConfirm(null);
+      setMenuOpen(null);
+      await onRefresh();
+    } catch (e) { console.error(e); }
   };
 
   const handleArchive = async (h: Habit) => {
-    await updateHabit({ ...h, archived: !h.archived });
-    setMenuOpen(null);
-    await onRefresh();
+    try {
+      await updateHabit({ ...h, archived: !h.archived });
+      setMenuOpen(null);
+      await onRefresh();
+    } catch (e) { console.error(e); }
   };
 
   const filteredIcons = useMemo(() => {
@@ -408,7 +446,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
   return (
     <div className="animate-fade-in" onClick={() => setMenuOpen(null)}>
 
-      {/* ===== HEADER ===== */}
+      {/* HEADER */}
       <div className="px-4 pt-5 pb-3">
         <div className="flex items-center justify-between mb-4">
           <Logo size={34} showName />
@@ -486,7 +524,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
         </div>
       </div>
 
-      {/* ===== HABITS LIST ===== */}
+      {/* HABITS LIST */}
       <div className="px-4 pb-4 space-y-2">
         {activeHabits.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 text-center">
@@ -494,9 +532,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
               <Target size={28} className="text-text-dim" />
             </div>
             <div className="text-text-muted text-sm font-semibold mb-1">No habits yet</div>
-            <div className="text-text-dim text-xs mb-5 max-w-[200px]">
-              Define your first discipline target
-            </div>
+            <div className="text-text-dim text-xs mb-5 max-w-[200px]">Define your first discipline target</div>
             <button
               onClick={openNewHabit}
               className="h-10 px-6 rounded-xl bg-gold text-bg text-xs font-bold flex items-center gap-2"
@@ -506,21 +542,19 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
           </div>
         ) : (
           <>
-            {activeHabits.length > 0 && (
-              <div className="flex items-center justify-between py-1 mb-1">
-                <span className="text-text-dim text-[10px] font-medium uppercase tracking-wider">
-                  {isToday ? "Today's habits" : `${dayName}, ${dateDisplay}`}
-                </span>
-                <span className="text-text-dim text-[10px] tabular-nums">
-                  {completedToday}/{activeHabits.length}
-                </span>
-              </div>
-            )}
+            <div className="flex items-center justify-between py-1 mb-1">
+              <span className="text-text-dim text-[10px] font-medium uppercase tracking-wider">
+                {isToday ? "Today's habits" : `${dayName}, ${dateDisplay}`}
+              </span>
+              <span className="text-text-dim text-[10px] tabular-nums">
+                {completedToday}/{activeHabits.length}
+              </span>
+            </div>
 
             {activeHabits.map(habit => {
               const log = dayLogs.get(habit.id);
-              const isCompleted = log?.completed || false;
-              const hasReason = log && !log.completed && log.excuseTag;
+              const isCompleted = log?.completed === true;
+              const hasReason = log && !log.completed && !!log.excuseTag;
               const isProc = processing === habit.id;
               const isMenuOpen = menuOpen === habit.id;
 
@@ -536,7 +570,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                   }`}
                 >
                   <div className="flex items-center gap-3 p-3.5">
-                    {/* Main tap zone — completes OR opens uncheck reason if already done */}
+                    {/* Tap to toggle */}
                     <button
                       onClick={() => handleHabitTap(habit)}
                       disabled={isProc}
@@ -549,7 +583,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                       }`}
                     >
                       {isProc ? (
-                        <Icon name="Loader2" size={20} className="text-text-dim animate-spin-slow" />
+                        <Icon name="Loader2" size={20} className="text-text-dim animate-spin" />
                       ) : isCompleted ? (
                         <CheckCircle2 size={22} className="text-success" strokeWidth={2} />
                       ) : (
@@ -579,7 +613,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                       </div>
                     </div>
 
-                    {/* Context menu */}
+                    {/* Menu */}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -591,32 +625,24 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                     </button>
                   </div>
 
-                  {/* Skip link — only show if no log at all */}
-                  {!log && !isProc && (
-                    <div className="px-3.5 pb-3 -mt-1">
+                  {/* Status hint row */}
+                  <div className="px-3.5 pb-3 -mt-1 flex items-center gap-2">
+                    {!log && !isProc && (
                       <button
-                        onClick={() => openReasonForSkip(habit)}
+                        onClick={(e) => { e.stopPropagation(); openReasonForSkip(habit); }}
                         className="text-[10px] text-text-dim hover:text-danger/70 transition-colors font-medium flex items-center gap-1"
                       >
                         <X size={9} className="text-danger/40" />
                         Didn't do it
                       </button>
-                    </div>
-                  )}
-
-                  {/* Hint for completed — tap icon to uncheck */}
-                  {isCompleted && !isProc && (
-                    <div className="px-3.5 pb-3 -mt-1">
-                      <p className="text-[9px] text-text-dim">Tap to uncheck</p>
-                    </div>
-                  )}
-
-                  {/* Hint for skipped — tap icon to redo */}
-                  {hasReason && !isProc && (
-                    <div className="px-3.5 pb-3 -mt-1">
-                      <p className="text-[9px] text-text-dim">Tap to mark done</p>
-                    </div>
-                  )}
+                    )}
+                    {isCompleted && !isProc && (
+                      <p className="text-[9px] text-success/40">Done — tap to uncheck</p>
+                    )}
+                    {hasReason && !isProc && (
+                      <p className="text-[9px] text-text-dim">Tap the icon to mark done</p>
+                    )}
+                  </div>
 
                   {/* Dropdown menu */}
                   {isMenuOpen && (
@@ -649,8 +675,18 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                         <div className="px-3 py-2">
                           <p className="text-[10px] text-danger mb-2">Delete all data?</p>
                           <div className="flex gap-1.5">
-                            <button onClick={() => setDeleteConfirm(null)} className="flex-1 py-1.5 rounded-lg bg-bg-card text-[10px] text-text-muted">No</button>
-                            <button onClick={() => handleDeleteHabit(habit.id)} className="flex-1 py-1.5 rounded-lg bg-danger text-[10px] text-white font-bold">Yes</button>
+                            <button
+                              onClick={() => setDeleteConfirm(null)}
+                              className="flex-1 py-1.5 rounded-lg bg-bg-card text-[10px] text-text-muted"
+                            >
+                              No
+                            </button>
+                            <button
+                              onClick={() => handleDeleteHabit(habit.id)}
+                              className="flex-1 py-1.5 rounded-lg bg-danger text-[10px] text-white font-bold"
+                            >
+                              Yes
+                            </button>
                           </div>
                         </div>
                       ) : (
@@ -702,6 +738,18 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                     >
                       <Trash2 size={13} />
                     </button>
+                    {deleteConfirm === h.id && (
+                      <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4" onClick={() => setDeleteConfirm(null)}>
+                        <div className="bg-bg-card rounded-2xl border border-border p-5 w-full max-w-xs" onClick={e => e.stopPropagation()}>
+                          <p className="text-sm font-bold mb-1">Delete "{h.name}"?</p>
+                          <p className="text-text-dim text-xs mb-4">All logs will be permanently deleted.</p>
+                          <div className="flex gap-2">
+                            <button onClick={() => setDeleteConfirm(null)} className="flex-1 py-2.5 rounded-xl border border-border text-text-muted text-sm">Cancel</button>
+                            <button onClick={() => handleDeleteHabit(h.id)} className="flex-1 py-2.5 rounded-xl bg-danger text-white text-sm font-bold">Delete</button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -710,7 +758,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
         )}
       </div>
 
-      {/* ===== SKIP/UNCHECK REASON MODAL ===== */}
+      {/* REASON MODAL */}
       {reasonModal && (
         <div
           className="fixed inset-0 bg-black/92 z-50 flex items-end justify-center"
@@ -732,8 +780,8 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                   <h3 className="text-sm font-bold">{reasonModal.habitName}</h3>
                   <p className="text-text-dim text-[11px] mt-0.5">
                     {reasonModal.mode === 'uncheck'
-                      ? 'Why are you removing this? Pick a reason.'
-                      : 'What got in the way?'}
+                      ? 'Removing completion — pick a reason.'
+                      : 'What got in the way today?'}
                   </p>
                 </div>
               </div>
@@ -743,6 +791,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
               <div className="grid grid-cols-2 gap-2 mb-4">
                 {EXCUSE_OPTIONS.map(excuse => {
                   const config = REASON_CONFIG[excuse];
+                  if (!config) return null;
                   const isSelected = selectedReason === excuse;
                   return (
                     <button
@@ -792,7 +841,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                   className="flex-1 py-3.5 rounded-xl bg-bg-elevated border border-border text-text font-bold text-sm disabled:opacity-30 flex items-center justify-center gap-2 hover:border-gold/30 transition-all"
                 >
                   {submittingReason
-                    ? <Icon name="Loader2" size={14} className="animate-spin-slow" />
+                    ? <Icon name="Loader2" size={14} className="animate-spin" />
                     : <><Check size={14} className="text-gold" strokeWidth={2.5} /> Save</>
                   }
                 </button>
@@ -803,7 +852,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
         </div>
       )}
 
-      {/* ===== NUMERIC MODAL ===== */}
+      {/* NUMERIC MODAL */}
       {numericModal && (
         <div
           className="fixed inset-0 bg-black/92 z-50 flex items-end justify-center"
@@ -842,7 +891,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                 parseFloat(numericValue) >= (numericModal.habit.targetValue || 1) ? 'text-success' : 'text-warning'
               }`}>
                 {parseFloat(numericValue) >= (numericModal.habit.targetValue || 1)
-                  ? 'Target reached ✓'
+                  ? '✓ Target reached'
                   : `${((parseFloat(numericValue) / (numericModal.habit.targetValue || 1)) * 100).toFixed(0)}% of target`
                 }
               </div>
@@ -867,7 +916,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
         </div>
       )}
 
-      {/* ===== HABIT FORM MODAL ===== */}
+      {/* HABIT FORM MODAL */}
       {habitFormModal !== null && (
         <div
           className="fixed inset-0 bg-black/90 z-50 flex items-end justify-center"
@@ -897,7 +946,9 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                   onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
                   placeholder="e.g. Morning run, Read 30 pages..."
                   autoFocus
-                  onKeyDown={e => e.key === 'Enter' && !showIconPicker && handleSaveHabit()}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && !showIconPicker) handleSaveHabit();
+                  }}
                   className="w-full bg-bg rounded-xl border border-border p-3.5 text-sm text-text placeholder-text-dim focus:outline-none focus:border-gold/60 transition-colors"
                 />
               </div>
@@ -906,6 +957,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
               <div>
                 <label className="block text-[10px] text-text-dim uppercase tracking-[0.15em] font-medium mb-2">Icon</label>
                 <button
+                  type="button"
                   onClick={() => setShowIconPicker(v => !v)}
                   className="w-full flex items-center gap-3 p-3 rounded-xl bg-bg border border-border hover:border-gold/30 transition-colors"
                 >
@@ -934,6 +986,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                       {['All', ...Object.keys(ICON_CATEGORIES)].map(tab => (
                         <button
                           key={tab}
+                          type="button"
                           onClick={() => setIconTab(tab)}
                           className={`px-3 py-1.5 rounded-xl text-[10px] whitespace-nowrap font-bold transition-all flex-shrink-0 ${
                             iconTab === tab
@@ -949,6 +1002,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                       {filteredIcons.map(iconName => (
                         <button
                           key={iconName}
+                          type="button"
                           onClick={() => { setForm(f => ({ ...f, icon: iconName })); setShowIconPicker(false); }}
                           className={`aspect-square rounded-lg flex items-center justify-center transition-all ${
                             form.icon === iconName
@@ -975,6 +1029,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                   {CATEGORIES.map(c => (
                     <button
                       key={c}
+                      type="button"
                       onClick={() => setForm(f => ({ ...f, category: c }))}
                       className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition-all ${
                         form.category === c
@@ -993,6 +1048,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                 <label className="block text-[10px] text-text-dim uppercase tracking-[0.15em] font-medium mb-2">Tracking</label>
                 <div className="grid grid-cols-2 gap-2">
                   <button
+                    type="button"
                     onClick={() => setForm(f => ({ ...f, targetType: 'boolean' }))}
                     className={`py-3 rounded-xl text-sm font-bold border transition-all flex items-center justify-center gap-2 ${
                       form.targetType === 'boolean'
@@ -1003,6 +1059,7 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
                     <Check size={15} /> Done / Not
                   </button>
                   <button
+                    type="button"
                     onClick={() => setForm(f => ({ ...f, targetType: 'numeric' }))}
                     className={`py-3 rounded-xl text-sm font-bold border transition-all flex items-center justify-center gap-2 ${
                       form.targetType === 'numeric'
@@ -1029,12 +1086,13 @@ export default function HomeView({ habits, logs, selectedDate, onDateChange, onR
               </div>
 
               <button
+                type="button"
                 onClick={handleSaveHabit}
                 disabled={!form.name.trim() || saving}
                 className="w-full py-4 rounded-xl bg-gold text-bg font-bold text-sm disabled:opacity-30 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
               >
                 {saving ? (
-                  <><Icon name="Loader2" size={16} className="animate-spin-slow" /> Saving...</>
+                  <><Icon name="Loader2" size={16} className="animate-spin" /> Saving...</>
                 ) : (
                   <><Check size={16} strokeWidth={2.5} />{habitFormModal.editing ? 'Save Changes' : 'Create Habit'}</>
                 )}

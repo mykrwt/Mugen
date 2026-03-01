@@ -3,7 +3,7 @@ import {
   BarChart3, TrendingUp, AlertTriangle, Flame,
   Trophy, Target, Brain, WifiOff, Loader2,
   Zap, RefreshCw, ShieldAlert, AlertCircle,
-  Send, Sparkles, Clock, ChevronDown, ChevronUp,
+  Send, Sparkles, Clock, ChevronDown, ChevronUp, KeyRound,
 } from 'lucide-react';
 import type { Habit, DailyLog, AIAnalysis } from '../db';
 import { getSetting, saveAnalysis, getAllAnalyses, generateId } from '../db';
@@ -44,21 +44,47 @@ interface ChatMessage {
   isAnalysis?: boolean;
 }
 
-// ---- Helper: read API key fresh from DB each time ----
+// Read API key fresh from DB on every call — no caching
 async function loadApiKey(): Promise<string> {
   try {
     const key = await getSetting('geminiApiKey');
     if (key && typeof key === 'string' && key.trim().length > 10) {
       return key.trim();
     }
-  } catch { /* ignore */ }
+  } catch (e) {
+    console.error('Failed to load API key:', e);
+  }
   return '';
+}
+
+// Parse Gemini error codes into user-friendly messages
+function parseGeminiError(err: unknown): AppError {
+  const raw = ((err as Error)?.message || '').trim();
+  const lower = raw.toLowerCase();
+
+  if (raw.startsWith('RATE_LIMIT') || lower.includes('rate') || lower.includes('quota') || lower.includes('resource_exhausted') || lower.includes('429')) {
+    return { type: 'rate_limit', message: 'Rate limited. Wait 60 seconds and try again.' };
+  }
+  if (raw.startsWith('INVALID_KEY') || lower.includes('invalid') || lower.includes('api key') || lower.includes('permission') || lower.includes('401') || lower.includes('403')) {
+    return { type: 'invalid_key', message: 'Invalid API key. Check your key in Settings → Gemini API Key.' };
+  }
+  if (raw.startsWith('NETWORK_ERROR') || lower.includes('fetch') || lower.includes('network') || lower.includes('failed to fetch')) {
+    return { type: 'network', message: 'Network error. Check your connection and try again.' };
+  }
+  if (raw.startsWith('SERVER_ERROR') || lower.includes('503') || lower.includes('overload') || lower.includes('unavailable')) {
+    return { type: 'overloaded', message: 'Gemini is overloaded. Try again in a moment.' };
+  }
+  if (raw.startsWith('MODEL_NOT_FOUND') || lower.includes('model')) {
+    return { type: 'generic', message: 'Model unavailable. Retrying with backup model...' };
+  }
+  // Show raw message for unknown errors so user can debug
+  return { type: 'generic', message: raw.length > 0 ? `Error: ${raw.slice(0, 150)}` : 'Something went wrong. Check your API key in Settings.' };
 }
 
 export default function InsightsView({ habits, logs, online }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>('Analytics');
 
-  // ---- Analytics ----
+  // Analytics
   const excuseFreq = useMemo(() => getExcuseFrequency(logs), [logs]);
   const excuseEntries = useMemo(() =>
     Object.entries(excuseFreq).sort((a, b) => b[1] - a[1]), [excuseFreq]);
@@ -77,6 +103,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
   }, [habits, logs]);
 
   const completionRates = useMemo(() => getCompletionRate7Days(logs), [logs]);
+
   const habitStats = useMemo(() => {
     return habits.filter(h => !h.archived).map(h => {
       const hLogs = logs.filter(l => l.habitId === h.id);
@@ -98,7 +125,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
   const maxScore = Math.max(...last28Scores.map(s => s.score), 1);
   const activeHabits = habits.filter(h => !h.archived);
 
-  // ---- AI Coach Chat ----
+  // AI Coach Chat
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(false);
@@ -108,58 +135,38 @@ export default function InsightsView({ habits, logs, online }: Props) {
   const [hasKey, setHasKey] = useState(false);
   const [keyChecked, setKeyChecked] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  // Check if key exists (for UI only - don't cache the actual key)
   const checkKey = useCallback(async () => {
     const key = await loadApiKey();
     setHasKey(key.length > 0);
     setKeyChecked(true);
-    const analyses = await getAllAnalyses();
-    setAnalysisHistory(analyses);
+    try {
+      const analyses = await getAllAnalyses();
+      setAnalysisHistory(analyses);
+    } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => {
-    checkKey();
-  }, [checkKey]);
+  useEffect(() => { checkKey(); }, [checkKey]);
 
-  // Re-check key every time AI tab is opened
+  // Re-check key when switching to AI tab
   useEffect(() => {
     if (activeTab === 'AI Coach') {
       checkKey();
+      setAppError(null);
     }
   }, [activeTab, checkKey]);
 
-  const scrollToBottom = () => {
-    setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
-  };
-
-  const parseError = (err: unknown): AppError => {
-    const msg = ((err as Error)?.message || '').toLowerCase();
-    const rawMsg = (err as Error)?.message || '';
-    if (msg.includes('429') || msg.includes('rate') || msg.includes('quota') || msg.includes('resource_exhausted')) {
-      return { type: 'rate_limit', message: 'Rate limited by Gemini. Wait a minute and try again.' };
-    }
-    if (msg.includes('401') || msg.includes('403') || msg.includes('api_key_invalid') || msg.includes('api key') || msg.includes('invalid')) {
-      return { type: 'invalid_key', message: 'Invalid API key. Double-check it in Settings.' };
-    }
-    if (msg.includes('503') || msg.includes('overload') || msg.includes('unavailable')) {
-      return { type: 'overloaded', message: 'Gemini is overloaded right now. Try again shortly.' };
-    }
-    if (msg.includes('fetch') || msg.includes('network') || msg.includes('failed to fetch')) {
-      return { type: 'network', message: 'Network error. Check your connection.' };
-    }
-    return { type: 'generic', message: rawMsg.slice(0, 120) || 'Something went wrong. Check your API key in Settings.' };
-  };
+  const scrollToBottom = useCallback(() => {
+    setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 150);
+  }, []);
 
   const handleFullAnalysis = async () => {
     if (loading) return;
 
-    // Read key FRESH from DB right now
     const key = await loadApiKey();
 
     if (!key) {
-      setAppError({ type: 'no_key', message: 'No API key found. Add your Gemini key in Settings.' });
+      setAppError({ type: 'no_key', message: 'No API key. Add your Gemini key in Settings tab.' });
       return;
     }
     if (!online) {
@@ -185,6 +192,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
 
     try {
       const response = await analyzeWithGemini(key, habits, logs);
+
       const aiMsg: ChatMessage = {
         id: generateId(),
         role: 'assistant',
@@ -201,12 +209,12 @@ export default function InsightsView({ habits, logs, online }: Props) {
         storedSnapshotOfData: JSON.stringify({ habits: habits.length, logs: logs.length }),
       };
       await saveAnalysis(analysis);
-
       const analyses = await getAllAnalyses();
       setAnalysisHistory(analyses);
       scrollToBottom();
     } catch (err) {
-      setAppError(parseError(err));
+      console.error('Full analysis error:', err);
+      setAppError(parseGeminiError(err));
       setMessages(prev => prev.filter(m => m.id !== userMsg.id));
     } finally {
       setLoading(false);
@@ -217,7 +225,6 @@ export default function InsightsView({ habits, logs, online }: Props) {
     const text = inputText.trim();
     if (!text || loading) return;
 
-    // Read key FRESH from DB right now
     const key = await loadApiKey();
 
     if (!key) {
@@ -248,6 +255,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
         text: m.text,
       }));
       const response = await chatWithGemini(key, text, habits, logs, chatHistory);
+
       const aiMsg: ChatMessage = {
         id: generateId(),
         role: 'assistant',
@@ -257,7 +265,8 @@ export default function InsightsView({ habits, logs, online }: Props) {
       setMessages(prev => [...prev, aiMsg]);
       scrollToBottom();
     } catch (err) {
-      setAppError(parseError(err));
+      console.error('Chat error:', err);
+      setAppError(parseGeminiError(err));
     } finally {
       setLoading(false);
     }
@@ -267,7 +276,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
     return text.split('\n').map((line, i) => {
       if (line.startsWith('## ')) {
         return (
-          <h2 key={i} className="text-gold font-bold text-xs mt-4 mb-1.5 tracking-wide first:mt-0 flex items-center gap-2">
+          <h2 key={i} className="text-gold font-bold text-xs mt-4 mb-1.5 first:mt-0 flex items-center gap-2">
             <div className="w-1 h-3 rounded-full bg-gold flex-shrink-0" />
             {line.replace(/^##\s*\d*\.?\s*/, '')}
           </h2>
@@ -308,26 +317,28 @@ export default function InsightsView({ habits, logs, online }: Props) {
     });
   };
 
+  // Error banner
   const ErrorBanner = ({ error }: { error: AppError }) => {
     const isWarn = ['rate_limit', 'network', 'overloaded'].includes(error.type);
-    const Icon2 = error.type === 'rate_limit' ? Zap
+    const EIcon = error.type === 'rate_limit' ? Zap
       : error.type === 'invalid_key' ? ShieldAlert
+      : error.type === 'no_key' ? KeyRound
       : error.type === 'network' ? WifiOff
       : AlertCircle;
     return (
-      <div className={`rounded-2xl p-3 border mb-3 flex-shrink-0 animate-fade-in ${
+      <div className={`rounded-2xl p-3.5 border mb-3 flex-shrink-0 animate-fade-in ${
         isWarn ? 'bg-warning/8 border-warning/25' : 'bg-danger/8 border-danger/25'
       }`}>
-        <div className="flex items-start gap-2">
-          <Icon2 size={13} className={`${isWarn ? 'text-warning' : 'text-danger'} flex-shrink-0 mt-0.5`} />
+        <div className="flex items-start gap-2.5">
+          <EIcon size={13} className={`${isWarn ? 'text-warning' : 'text-danger'} flex-shrink-0 mt-0.5`} />
           <p className={`text-xs flex-1 leading-relaxed ${isWarn ? 'text-warning/90' : 'text-danger/90'}`}>
             {error.message}
           </p>
           <button
             onClick={() => setAppError(null)}
-            className="flex-shrink-0 text-text-dim hover:text-gold transition-colors"
+            className="flex-shrink-0 text-text-dim hover:text-gold transition-colors p-0.5"
           >
-            <RefreshCw size={12} />
+            <RefreshCw size={11} />
           </button>
         </div>
       </div>
@@ -349,7 +360,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
-              className={`py-2 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+              className={`py-2.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
                 activeTab === tab
                   ? 'bg-gold/15 text-gold border border-gold/30'
                   : 'text-text-dim hover:text-text-muted'
@@ -362,7 +373,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
         </div>
       </div>
 
-      {/* =================== ANALYTICS TAB =================== */}
+      {/* ANALYTICS TAB */}
       {activeTab === 'Analytics' && (
         <div className="px-4 pb-4 space-y-3 flex-1">
           {activeHabits.length === 0 ? (
@@ -405,7 +416,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
                       <span className="text-[9px] text-text-dim tabular-nums font-medium">{Math.round(rate * 100)}%</span>
                       <div className="w-full flex-1 flex flex-col justify-end">
                         <div
-                          className="w-full rounded-t-md"
+                          className="w-full rounded-t-md transition-all"
                           style={{
                             height: `${Math.max(4, rate * 64)}px`,
                             backgroundColor:
@@ -441,14 +452,14 @@ export default function InsightsView({ habits, logs, online }: Props) {
                   {last28Scores.map((s, i) => (
                     <div
                       key={i}
-                      className="flex-1 rounded-t-[2px]"
+                      className="flex-1 rounded-t-[2px] transition-all"
                       style={{
                         height: `${Math.max(2, (s.score / Math.max(maxScore, 1)) * 60)}px`,
                         backgroundColor:
                           s.score > 70 ? '#22c55e' :
                           s.score > 40 ? '#f59e0b' :
                           s.score > 0 ? '#ef4444' : '#1a1a1a',
-                        opacity: i < 14 ? 0.55 : 1,
+                        opacity: i < 14 ? 0.5 : 1,
                       }}
                       title={`${s.date}: ${s.score}%`}
                     />
@@ -578,7 +589,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
                         </span>
                         {excuses > 0 && (
                           <span className="text-[10px] text-danger/70 flex items-center gap-0.5">
-                            <AlertTriangle size={9} />{excuses}
+                            <AlertTriangle size={9} />{excuses} skipped
                           </span>
                         )}
                       </div>
@@ -591,10 +602,10 @@ export default function InsightsView({ habits, logs, online }: Props) {
         </div>
       )}
 
-      {/* =================== AI COACH TAB =================== */}
+      {/* AI COACH TAB */}
       {activeTab === 'AI Coach' && (
         <div className="flex flex-col flex-1 px-4 pb-4" style={{ minHeight: 0 }}>
-          {/* Offline banner */}
+          {/* Offline */}
           {!online && (
             <div className="bg-warning/8 border border-warning/20 rounded-2xl p-3 flex items-center gap-2.5 mb-3 flex-shrink-0">
               <WifiOff size={13} className="text-warning flex-shrink-0" />
@@ -606,38 +617,55 @@ export default function InsightsView({ habits, logs, online }: Props) {
           {keyChecked && !hasKey && (
             <div className="bg-bg-card border border-gold/20 rounded-2xl p-4 mb-3 flex-shrink-0">
               <div className="flex items-start gap-2.5">
-                <Sparkles size={14} className="text-gold mt-0.5 flex-shrink-0" />
+                <KeyRound size={14} className="text-gold mt-0.5 flex-shrink-0" />
                 <div>
-                  <p className="text-text text-xs font-semibold mb-0.5">No API key</p>
+                  <p className="text-text text-xs font-semibold mb-1">Gemini API key missing</p>
                   <p className="text-text-dim text-[11px] leading-relaxed">
-                    Add your Gemini API key in <span className="text-gold font-semibold">Settings</span> tab.{' '}
-                    Free key at <span className="text-gold font-semibold">aistudio.google.com</span>
+                    Go to <span className="text-gold font-semibold">Settings → Gemini API Key</span> and paste your free key from{' '}
+                    <span className="text-gold font-semibold">aistudio.google.com</span>
                   </p>
                 </div>
               </div>
             </div>
           )}
 
-          {/* Error banner */}
+          {/* Error */}
           {appError && <ErrorBanner error={appError} />}
 
-          {/* Chat messages */}
+          {/* Chat area */}
           <div
             className="flex-1 overflow-y-auto space-y-3 mb-3"
-            style={{ minHeight: 120, maxHeight: 'calc(100vh - 360px)' }}
+            style={{ minHeight: 120, maxHeight: 'calc(100vh - 340px)' }}
           >
             {messages.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-8 text-center">
+              <div className="flex flex-col items-center justify-center py-10 text-center">
                 <div
                   className="w-14 h-14 rounded-2xl bg-bg-card border border-gold/15 flex items-center justify-center mb-3"
                   style={{ boxShadow: '0 0 30px rgba(212,175,55,0.06)' }}
                 >
                   <Brain size={24} className="text-gold/70" />
                 </div>
-                <p className="text-text-muted text-xs font-semibold mb-1">AI Behavioral Coach</p>
+                <p className="text-text-muted text-xs font-semibold mb-1">Behavioral Coach</p>
                 <p className="text-text-dim text-[11px] max-w-[200px] leading-relaxed">
                   Brutally honest. Data-driven. No excuses accepted.
                 </p>
+                {hasKey && online && (
+                  <div className="mt-4 space-y-1.5 w-full max-w-[260px]">
+                    {[
+                      'Why am I failing my habits?',
+                      'What\'s my biggest weakness?',
+                      'How can I improve my streak?',
+                    ].map(q => (
+                      <button
+                        key={q}
+                        onClick={() => setInputText(q)}
+                        className="w-full text-left px-3 py-2 rounded-xl bg-bg-card border border-border text-[11px] text-text-dim hover:text-text-muted hover:border-gold/20 transition-all"
+                      >
+                        {q}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               messages.map(msg => (
@@ -669,6 +697,8 @@ export default function InsightsView({ habits, logs, online }: Props) {
                 </div>
               ))
             )}
+
+            {/* Typing indicator */}
             {loading && (
               <div className="flex items-start gap-2">
                 <div className="w-6 h-6 rounded-lg bg-gold/10 border border-gold/20 flex items-center justify-center flex-shrink-0">
@@ -676,9 +706,13 @@ export default function InsightsView({ habits, logs, online }: Props) {
                 </div>
                 <div className="bg-bg-card border border-border rounded-2xl rounded-bl-sm px-4 py-3">
                   <div className="flex items-center gap-1.5">
-                    <div className="w-1.5 h-1.5 rounded-full bg-gold animate-pulse" style={{ animationDelay: '0ms' }} />
-                    <div className="w-1.5 h-1.5 rounded-full bg-gold animate-pulse" style={{ animationDelay: '200ms' }} />
-                    <div className="w-1.5 h-1.5 rounded-full bg-gold animate-pulse" style={{ animationDelay: '400ms' }} />
+                    {[0, 200, 400].map(delay => (
+                      <div
+                        key={delay}
+                        className="w-1.5 h-1.5 rounded-full bg-gold/60 animate-bounce"
+                        style={{ animationDelay: `${delay}ms`, animationDuration: '1s' }}
+                      />
+                    ))}
                   </div>
                 </div>
               </div>
@@ -690,7 +724,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
           <button
             onClick={handleFullAnalysis}
             disabled={loading || !online || !hasKey}
-            className="w-full py-3 rounded-xl bg-bg-card border border-gold/20 text-gold text-xs font-bold disabled:opacity-30 transition-all flex items-center justify-center gap-2 mb-3 hover:bg-gold/5 active:scale-[0.98] flex-shrink-0"
+            className="w-full py-3 rounded-xl bg-bg-card border border-gold/20 text-gold text-xs font-bold disabled:opacity-30 transition-all flex items-center justify-center gap-2 mb-2.5 hover:bg-gold/5 active:scale-[0.98] flex-shrink-0"
           >
             {loading ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
             Full Pattern Analysis
@@ -699,7 +733,6 @@ export default function InsightsView({ habits, logs, online }: Props) {
           {/* Chat input */}
           <div className="flex gap-2 flex-shrink-0">
             <textarea
-              ref={inputRef}
               value={inputText}
               onChange={e => setInputText(e.target.value)}
               onKeyDown={e => {
@@ -708,7 +741,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
                   handleSendMessage();
                 }
               }}
-              placeholder={hasKey ? "Ask about your habits..." : "Add API key in Settings first"}
+              placeholder={hasKey && online ? 'Ask about your habits...' : !online ? 'Offline' : 'Add API key in Settings'}
               disabled={!online || !hasKey || loading}
               rows={1}
               className="flex-1 bg-bg-card border border-border rounded-xl px-4 py-3 text-xs text-text placeholder-text-dim focus:outline-none focus:border-gold/40 transition-colors resize-none disabled:opacity-40"
@@ -730,7 +763,7 @@ export default function InsightsView({ habits, logs, online }: Props) {
                 onClick={() => setShowHistory(!showHistory)}
                 className="flex items-center gap-2 w-full py-1.5 text-text-dim text-[10px] tracking-[0.15em] uppercase font-medium"
               >
-                <Clock size={10} /> Past Analyses ({analysisHistory.length})
+                <Clock size={10} /> Past ({analysisHistory.length})
                 {showHistory ? <ChevronUp size={10} className="ml-auto" /> : <ChevronDown size={10} className="ml-auto" />}
               </button>
               {showHistory && (
